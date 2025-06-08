@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import io
+import os
 import psycopg2
 import psycopg2.extras
 
@@ -31,6 +32,10 @@ def loadratings(table_name, filepath, conn):
     """
     cur = conn.cursor()
     try:
+        # Kiểm tra file tồn tại
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File không tồn tại: {filepath}")
+        
         # 1. Drop & create
         cur.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
         cur.execute(f"""
@@ -59,9 +64,9 @@ def loadratings(table_name, filepath, conn):
         )
 
         conn.commit()
-    except Exception:
+    except Exception as e:
         conn.rollback()
-        raise
+        raise RuntimeError(f"Lỗi load ratings: {e}")
     finally:
         cur.close()
 
@@ -167,32 +172,52 @@ def roundrobinpartition(table_name, num_partitions, conn):
                 );
             """)
 
-        # Lấy toàn bộ dòng, sắp xếp ổn định
+        # Sử dụng cursor để xử lý dữ liệu lớn hiệu quả hơn
         cur.execute(f"""
-            SELECT userid, movieid, rating
+            SELECT userid, movieid, rating, 
+                   ROW_NUMBER() OVER (ORDER BY userid, movieid, rating) - 1 as rn
               FROM {table_name}
           ORDER BY userid, movieid, rating;
         """)
-        rows = cur.fetchall()
 
-        # Phân phối vào buckets
+        # Chuẩn bị buckets cho batch insert
         buckets = [[] for _ in range(num_partitions)]
-        for idx, row in enumerate(rows):
-            buckets[idx % num_partitions].append(row)
+        batch_size = 10000
+        total_rows = 0
 
-        # Batch insert từng bucket
+        while True:
+            rows = cur.fetchmany(batch_size)
+            if not rows:
+                break
+            
+            for userid, movieid, rating, rn in rows:
+                partition_idx = rn % num_partitions
+                buckets[partition_idx].append((userid, movieid, rating))
+                total_rows += 1
+            
+            # Batch insert khi bucket đầy
+            for i, batch in enumerate(buckets):
+                if len(batch) >= 1000:  # Insert khi có đủ 1000 records
+                    psycopg2.extras.execute_values(
+                        cur,
+                        f"INSERT INTO rrobin_part{i} (userid, movieid, rating) VALUES %s",
+                        batch,
+                        page_size=1000
+                    )
+                    buckets[i] = []  # Clear bucket
+
+        # Insert phần còn lại
         for i, batch in enumerate(buckets):
-            if not batch:
-                continue
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO rrobin_part{i} (userid, movieid, rating) VALUES %s",
-                batch,
-                page_size=1000
-            )
+            if batch:
+                psycopg2.extras.execute_values(
+                    cur,
+                    f"INSERT INTO rrobin_part{i} (userid, movieid, rating) VALUES %s",
+                    batch,
+                    page_size=1000
+                )
 
         # Cập nhật metadata: last_rr_index = số dòng tổng – 1
-        last_idx = len(rows) - 1 if rows else -1
+        last_idx = total_rows - 1 if total_rows > 0 else -1
         cur.execute(f"""
             INSERT INTO {ROBIN_META}(table_name, partition_count, last_rr_index)
             VALUES (%s, %s, %s)
@@ -215,6 +240,10 @@ def rangeinsert(table_name, userid, movieid, rating, conn):
     """
     cur = conn.cursor()
     try:
+        # Validate input
+        if not (0.0 <= rating <= 5.0):
+            raise ValueError(f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}")
+            
         # 1) Insert vào bảng chính
         cur.execute(f"""
             INSERT INTO {table_name}(userid, movieid, rating)
@@ -232,14 +261,26 @@ def rangeinsert(table_name, userid, movieid, rating, conn):
             raise RuntimeError("Phải gọi rangepartition trước khi rangeinsert")
         N, min_rating, max_rating = meta
 
-        # 3) Tính partition index
+        # 3) Tính partition index - sử dụng logic giống với rangepartition
         delta = (max_rating - min_rating) / N
-        idx = int((rating - min_rating) / delta)
-        if rating == max_rating:
-            idx = N - 1
-        elif idx > 0 and abs(rating - (min_rating + idx*delta)) < 1e-8:
-            idx -= 1
-        idx = max(0, min(idx, N-1))
+        
+        # Tìm partition phù hợp bằng cách kiểm tra từng khoảng
+        idx = N - 1  # default là partition cuối
+        
+        for i in range(N):
+            low = min_rating + i * delta
+            high = (min_rating + (i+1)*delta) if i < N-1 else max_rating
+            
+            if i == 0:
+                # Partition đầu: bao gồm cả low và high
+                if low <= rating <= high:
+                    idx = i
+                    break
+            else:
+                # Các partition khác: không bao gồm low, chỉ <= high
+                if low < rating <= high:
+                    idx = i
+                    break
 
         # 4) Chèn vào range_part{idx}
         cur.execute(f"""
@@ -254,13 +295,16 @@ def rangeinsert(table_name, userid, movieid, rating, conn):
     finally:
         cur.close()
 
-
 def roundrobininsert(table_name, userid, movieid, rating, conn):
     """
     Chèn bản ghi mới vào bảng chính và bảng rrobin_part kế tiếp.
     """
     cur = conn.cursor()
     try:
+        # Validate input
+        if not (0.0 <= rating <= 5.0):
+            raise ValueError(f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}")
+            
         # 1) Insert vào bảng chính
         cur.execute(f"""
             INSERT INTO {table_name}(userid, movieid, rating)
@@ -279,7 +323,8 @@ def roundrobininsert(table_name, userid, movieid, rating, conn):
         N, last_idx = meta
 
         # 3) Tính partition kế tiếp
-        next_idx = (last_idx + 1) % N if last_idx >= 0 else 0
+        new_last_idx = last_idx + 1
+        next_idx = new_last_idx % N
 
         # 4) Chèn vào rrobin_part{next_idx}
         cur.execute(f"""
@@ -292,7 +337,7 @@ def roundrobininsert(table_name, userid, movieid, rating, conn):
             UPDATE {ROBIN_META}
                SET last_rr_index = %s
              WHERE table_name    = %s;
-        """, (next_idx, table_name))
+        """, (new_last_idx, table_name))
 
         conn.commit()
     except Exception:
@@ -307,10 +352,12 @@ def count_partitions(prefix, conn):
     Trả về số bảng có tên bắt đầu bằng `prefix`.
     """
     cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*) FROM pg_stat_user_tables
-         WHERE relname LIKE %s;
-    """, (prefix + '%',))
-    cnt = cur.fetchone()[0]
-    cur.close()
-    return cnt
+    try:
+        cur.execute("""
+            SELECT COUNT(*) FROM pg_stat_user_tables
+             WHERE relname LIKE %s;
+        """, (prefix + '%',))
+        cnt = cur.fetchone()[0]
+        return cnt
+    finally:
+        cur.close()
