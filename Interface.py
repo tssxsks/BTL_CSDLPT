@@ -196,15 +196,18 @@ def roundrobinpartition(table_name, num_partitions, conn):
         """
         )
 
+        # Tạo buckets để thu thập bản ghi cho mỗi phân mảnh
         buckets = [[] for _ in range(num_partitions)]
         batch_size = 10000
-        row_index = 0
+        row_index = 0  # Theo dõi số bản ghi
 
+        # Xử lý theo lô
         while True:
             rows = sel_cur.fetchmany(batch_size)
             if not rows:
                 break
 
+            # Phân phối bản ghi vào buckets theo vòng tròn
             for userid, movieid, rating in rows:
                 part_idx = row_index % num_partitions
                 buckets[part_idx].append((userid, movieid, rating))
@@ -223,7 +226,7 @@ def roundrobinpartition(table_name, num_partitions, conn):
 
         sel_cur.close()  # Đóng con trỏ SELECT sau khi hoàn thành
 
-        # Chèn nốt phần còn lại
+        # Chèn nốt phần còn lại trong buckets
         for i, bucket in enumerate(buckets):
             if bucket:
                 psycopg2.extras.execute_values(
@@ -365,11 +368,11 @@ def roundrobininsert(table_name, userid, movieid, rating, conn):
             )
         num_partitions, last_idx = meta
 
-        # Tính chỉ số bảng kế tiếp
+        # Tính chỉ số phân mảnh kế tiếp
         new_last_idx = last_idx + 1
         part_idx = new_last_idx % num_partitions
 
-        # Insert vào bảng phân vùng
+        # Insert vào phân mảnh tương ứng
         cur.execute(
             f"""
             INSERT INTO rrobin_part{part_idx}(userid, movieid, rating)
