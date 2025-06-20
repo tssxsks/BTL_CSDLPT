@@ -171,9 +171,9 @@ def rangepartition(table_name, num_partitions, conn):
 
         # 3) Chèn dữ liệu vào từng bảng con theo điều kiện rating
         for i in range(num_partitions):
-            low = i * delta
+            low = min_rating +  i * delta
             # Đảm bảo phần trên của partition cuối = max_rating
-            high = (i + 1) * delta if i < num_partitions - 1 else max_rating
+            high = (min_rating + (i + 1) * delta) if i < num_partitions - 1 else max_rating
 
             # với partition 0: điều kiện rating >= low
             # các partition khác: rating > low
