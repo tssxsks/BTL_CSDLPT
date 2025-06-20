@@ -43,30 +43,34 @@ def create_metadata(meta_table, meta_values, conflict_updates, conn):
     try:
         # 1) Tạo bảng metadata nếu chưa có, tuỳ theo loại RANGE hay ROUND-ROBIN
         if meta_table == RANGE_META:
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 CREATE TABLE IF NOT EXISTS {RANGE_META} (
                     table_name      TEXT PRIMARY KEY,
                     partition_count INT NOT NULL,
                     min_val         FLOAT NOT NULL,
                     max_val         FLOAT NOT NULL
                 );
-            """)
+            """
+            )
         elif meta_table == ROBIN_META:
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 CREATE TABLE IF NOT EXISTS {ROBIN_META} (
                     table_name       TEXT PRIMARY KEY,
                     partition_count  INT NOT NULL,
                     last_rr_index    BIGINT NOT NULL
                 );
-            """)
+            """
+            )
 
         # 2) Chuẩn bị câu lệnh INSERT ... ON CONFLICT để ghi hoặc cập nhật metadata
         columns = list(meta_values.keys())
         values = list(meta_values.values())
-        col_str = ', '.join(columns)
-        placeholder = ', '.join(['%s'] * len(values))
+        col_str = ", ".join(columns)
+        placeholder = ", ".join(["%s"] * len(values))
         # Xây dựng phần SET cho ON CONFLICT
-        conflict_set = ', '.join(f"{k} = EXCLUDED.{k}" for k in conflict_updates.keys())
+        conflict_set = ", ".join(f"{k} = EXCLUDED.{k}" for k in conflict_updates.keys())
 
         # 3) Thực thi INSERT với ON CONFLICT
         cur.execute(
@@ -98,13 +102,15 @@ def loadratings(table_name, filepath, conn):
 
         # Xoá bảng nếu đã tồn tại, rồi tạo lại với 3 cột
         cur.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE;")
-        cur.execute(f"""
+        cur.execute(
+            f"""
             CREATE TABLE {table_name} (
                 userid  INT,
                 movieid INT,
                 rating  FLOAT
             );
-        """)
+        """
+        )
 
         # Đọc file, chuyển "::" thành tab để COPY nhanh
         buf = io.StringIO()
@@ -138,7 +144,7 @@ def rangepartition(table_name, num_partitions, conn):
     - num_partitions: số phân vùng cần tạo (>=1)
     - conn: connection tới PostgreSQL
 
-    Tạo các bảng con range_part0, range_part1, ..., range_part{N-1}, 
+    Tạo các bảng con range_part0, range_part1, ..., range_part{N-1},
     chia đều khoảng [0.0, 5.0] theo num_partitions, rồi chèn dữ liệu vào.
     """
     cur = conn.cursor()
@@ -149,13 +155,15 @@ def rangepartition(table_name, num_partitions, conn):
         # 1) Tạo (hoặc xoá rồi tạo lại) bảng con cho mỗi phân vùng
         for i in range(num_partitions):
             cur.execute(f"DROP TABLE IF EXISTS range_part{i} CASCADE;")
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 CREATE TABLE range_part{i} (
                     userid  INT,
                     movieid INT,
                     rating  FLOAT
                 );
-            """)
+            """
+            )
 
         # 2) Xác định khoảng giá trị và độ rộng mỗi phân vùng
         min_rating, max_rating = 0.0, 5.0
@@ -163,9 +171,9 @@ def rangepartition(table_name, num_partitions, conn):
 
         # 3) Chèn dữ liệu vào từng bảng con theo điều kiện rating
         for i in range(num_partitions):
-            low = min_rating + i * delta
+            low = i * delta
             # Đảm bảo phần trên của partition cuối = max_rating
-            high = (min_rating + (i + 1) * delta) if i < num_partitions - 1 else max_rating
+            high = (i + 1) * delta if i < num_partitions - 1 else max_rating
 
             # với partition 0: điều kiện rating >= low
             # các partition khác: rating > low
@@ -175,12 +183,14 @@ def rangepartition(table_name, num_partitions, conn):
                 else f"rating > {low} AND rating <= {high}"
             )
 
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 INSERT INTO range_part{i}
                 SELECT userid, movieid, rating
                   FROM {table_name}
                  WHERE {cond};
-            """)
+            """
+            )
 
         # 4) Lưu metadata về range partition (số partitions, min, max) vào bảng RANGE_META
         create_metadata(
@@ -227,13 +237,15 @@ def roundrobinpartition(table_name, num_partitions, conn):
         # 1) Tạo (xoá rồi tạo lại) bảng con cho mỗi partition
         for i in range(num_partitions):
             cur.execute(f"DROP TABLE IF EXISTS rrobin_part{i} CASCADE;")
-            cur.execute(f"""
+            cur.execute(
+                f"""
                 CREATE TABLE rrobin_part{i} (
                     userid  INT,
                     movieid INT,
                     rating  FLOAT
                 );
-            """)
+            """
+            )
 
         # 2) Lấy toàn bộ dữ liệu từ bảng gốc
         sel_cur.execute(f"SELECT userid, movieid, rating FROM {table_name};")
@@ -241,7 +253,7 @@ def roundrobinpartition(table_name, num_partitions, conn):
         # Dùng buckets list để gom hàng chờ insert theo batch
         buckets = [[] for _ in range(num_partitions)]
         batch_size = 10000  # lấy mỗi lần 10k rows
-        row_index = 0       # đánh dấu thứ tự row để tính partition
+        row_index = 0  # đánh dấu thứ tự row để tính partition
 
         # 3) Lặp fetch và gom theo bucket
         while True:
@@ -318,7 +330,9 @@ def rangeinsert(table_name, userid, movieid, rating, conn):
     try:
         # 1) Kiểm tra rating hợp lệ
         if not (0.0 <= rating <= 5.0):
-            raise ValueError(f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}")
+            raise ValueError(
+                f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}"
+            )
 
         # 2) Insert vào bảng gốc
         cur.execute(
@@ -386,7 +400,9 @@ def roundrobininsert(table_name, userid, movieid, rating, conn):
     try:
         # 1) Kiểm tra rating hợp lệ
         if not (0.0 <= rating <= 5.0):
-            raise ValueError(f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}")
+            raise ValueError(
+                f"Rating phải trong khoảng [0.0, 5.0], nhận được: {rating}"
+            )
 
         # 2) Insert vào bảng gốc
         cur.execute(
@@ -408,7 +424,9 @@ def roundrobininsert(table_name, userid, movieid, rating, conn):
         )
         meta = cur.fetchone()
         if not meta:
-            raise RuntimeError("Phải gọi roundrobinpartition trước khi gọi roundrobininsert")
+            raise RuntimeError(
+                "Phải gọi roundrobinpartition trước khi gọi roundrobininsert"
+            )
         num_partitions, last_idx = meta
 
         # 4) Tính partition kế tiếp
